@@ -1,0 +1,40 @@
+[project]
+name = "dtecflex-extract-api"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Gabriel Fernandes",email = "gabriel.fernades@meuvidraceiro.com.br"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "celery[redis]>=5.5.3",
+    "fastapi[all,standard]>=0.115.13",
+    "flower>=2.0.1",
+    "redis>=5.2.1",
+    "requests>=2.32.4",
+    "sqlalchemy>=2.0.41",
+    "xlsxwriter>=3.2.5",
+    "pymysql (>=1.1.1,<2.0.0)",
+    "trafilatura (>=2.0.0,<3.0.0)",
+    "beautifulsoup4 (>=4.13.4,<5.0.0)",
+    "playwright (>=1.54.0,<2.0.0)",
+    "openai (>=1.97.1,<2.0.0)",
+    "python-dotenv (>=1.1.1,<2.0.0)",
+    "passlib[bcrypt] (>=1.7.4,<2.0.0)",
+    "pyjwt (>=2.10.1,<3.0.0)",
+    "python-multipart (>=0.0.20,<0.0.21)",
+    "python-jose[cryptography] (>=3.5.0,<4.0.0)",
+    "mysql-connector-python (>=9.4.0,<10.0.0)",
+]
+
+[tool.poetry]
+packages = [{include = "dtecflex_extract_api", from = "src"}]
+
+
+[tool.poetry.group.dev.dependencies]
+flower = "^2.0.1"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
