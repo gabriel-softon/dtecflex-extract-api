@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 import mysql.connector
 
 from src.dtecflex_extract_api.config.celery import settings
+from src.dtecflex_extract_api.config.celery import celery_app  # <-- importa o app do Celery
 
 # Mapeamentos
 CAT_ABREV = {
@@ -26,11 +27,6 @@ CATEGORY_MAPPING = {
 }
 
 def _db_conn():
-    # print('user:::', settings.DB_USER)
-    # print('DB_PASS:::', settings.DB_PASS)
-    # print('DB_HOST:::', settings.DB_HOST)
-    # print('DB_PORT:::', settings.DB_PORT)
-    # print('DB_NAME:::', settings.DB_NAME)
     return mysql.connector.connect(
         user=settings.DB_USER,
         password=settings.DB_PASS,
@@ -112,6 +108,24 @@ def fetch_nomes_por_noticia(noticia_id: int, logger) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
+def load_news(news_id: int) -> Dict[str, Any]:
+    """Busca os campos mínimos da notícia para popular a Auxiliar."""
+    conn = _db_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("""
+            SELECT ID, URL, FONTE, DATA_PUBLICACAO, CATEGORIA, REG_NOTICIA,
+                   TEXTO_NOTICIA, UF, REGIAO, OPERACAO, TITULO
+            FROM TB_NOTICIA_RASPADA
+            WHERE ID = %s
+        """, (news_id,))
+        row = cur.fetchone()
+        return row or {}
+    finally:
+        try:
+            cur.close(); conn.close()
+        except Exception:
+            pass
 
 def construir_caminhos(registro: Dict[str, Any], date_dir: str) -> Tuple[str, str]:
     local_pattern = f"{settings.MEDIA_BASE}/{registro['CAT_ABREV']}/{registro['CAT_PREFIX']}{date_dir}/{registro['REG_NOTICIA']}*"
@@ -140,8 +154,6 @@ def transferir_arquivo(local_pattern: str, remote_dir: str, noticia_id: int, log
     )
     logger.info(f"Executando rsync: {rsync_cmd}")
     result = subprocess.run(rsync_cmd, shell=True, capture_output=True, text=True)
-
-    print('result:::', result)
 
     if result.returncode == 0:
         try:
@@ -240,18 +252,27 @@ def fetch_noticias_publicadas(logger):
         except Exception:
             pass
 
-def insert_names_to_aux_for_news(news: Dict[str, Any], names: List[Dict[str, Any]], logger) -> Tuple[int, bool]:
+def insert_names_to_aux_for_news(news: Dict[str, Any], names: List[Dict[str, Any]], logger, *, chunk_size: int = 50) -> Tuple[int, bool]:
     """
-    Retorna (qtde_inserida, publicou_bool). Se inseriu ≥1, noticia vira 203-PUBLISHED.
+    Insere nomes em lotes pequenos (executemany) com commit curto e fallback por linha.
+    Retorna (qtde_inserida, publicou_bool).
     """
     if not names:
         return 0, False
 
+    conn = _db_conn()
+    cursor = conn.cursor()
     try:
-        conn = _db_conn()
-        cursor = conn.cursor()
+        conn.autocommit = False
+        # timeouts curtos só nesta sessão (evita "colar" indefinidamente)
+        try:
+            cursor.execute("SET SESSION innodb_lock_wait_timeout = 15")
+            cursor.execute("SET SESSION lock_wait_timeout = 15")
+            cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        except Exception as e:
+            logger.warning(f"[aux] não consegui ajustar timeouts de sessão: {e}")
 
-        insert_query = """
+        insert_sql = """
             INSERT INTO Auxiliar (
                 NOME, CPF, NOME_CPF, APELIDO, DTEC,
                 SEXO, PESSOA, IDADE, ATIVIDADE, ENVOLVIMENTO,
@@ -262,160 +283,156 @@ def insert_names_to_aux_for_news(news: Dict[str, Any], names: List[Dict[str, Any
                 LINK_NOTICIA, DATA_ATUALIZACAO, ORGAO, EMPRESA_RELACIONADA, CNPJ_EMPRESA_RELACIONADA,
                 RELACIONAMENTO, DATA_INICIO_MANDATO, DATA_FIM_MANDATO, DATA_CARENCIA
             ) VALUES (
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, NOW(),
-                %s, %s, %s, %s, NOW(),
-                %s, %s, %s, %s, %s,
-                %s, NOW(), %s, %s, %s,
-                %s, %s, %s, %s
+                %s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,
+                %s,%s,%s,%s,NOW(),
+                %s,%s,%s,%s,NOW(),
+                %s,%s,%s,%s,%s,
+                %s,NOW(),%s,%s,%s,
+                %s,%s,%s,%s
             )
         """
-
-        # campos fixos (iguais aos do fluxo atual)
-        dtec = existem_processos = origem_uf = tribunais = links_tribunais = None
-        pep_relacionado = orgao = empresa_relacionada = cnpj_empresa_relacionada = None
-        relacionamento = data_inicio_mandato = data_fim_mandato = data_carencia = None
 
         categoria = news.get("CATEGORIA")
         tipo_suspeita, tipo_informacao = CATEGORY_MAPPING.get(categoria, (None, None))
 
-        values_base = dict(
+        base = dict(
             titulo=news.get("TITULO"),
             data_noticia=news.get("DATA_PUBLICACAO"),
             fonte=news.get("FONTE"),
             regiao=news.get("REGIAO"),
             estado=news.get("UF"),
-            reg_noticia=news.get("REG_NOTICIA"),
+            reg=news.get("REG_NOTICIA"),
             texto=news.get("TEXTO_NOTICIA"),
             url=news.get("URL"),
         )
 
+        # campos fixos None
+        dtec = existem_processos = origem_uf = tribunais = links_tribunais = None
+        pep_rel = orgao = emp_rel = cnpj_emp_rel = None
+        relacionamento = dt_ini = dt_fim = dt_car = None
+
+        batch = []
+        for nm in names:
+            batch.append((
+                nm['NOME'], nm['CPF'], nm['NOME_CPF'], nm['APELIDO'], dtec,
+                nm['SEXO'], nm['PESSOA'], nm['IDADE'], nm['ATIVIDADE'], nm['ENVOLVIMENTO'],
+                tipo_suspeita, nm['OPERACAO'], base["titulo"], base["data_noticia"], base["fonte"],
+                base["regiao"], base["estado"], base["reg"], nm['FLG_PESSOA_PUBLICA'],
+                existem_processos, origem_uf, tribunais, links_tribunais,
+                tipo_informacao, nm['ANIVERSARIO'], base["texto"], nm['INDICADOR_PPE'], pep_rel,
+                base["url"], orgao, emp_rel, cnpj_emp_rel,
+                relacionamento, dt_ini, dt_fim, dt_car
+            ))
+
         inserted = 0
-        for name in names:
-            values = (
-                name['NOME'], name['CPF'], name['NOME_CPF'], name['APELIDO'], dtec,
-                name['SEXO'], name['PESSOA'], name['IDADE'], name['ATIVIDADE'], name['ENVOLVIMENTO'],
-                tipo_suspeita, name['OPERACAO'], values_base["titulo"], values_base["data_noticia"], values_base["fonte"],
-                values_base["regiao"], values_base["estado"], values_base["reg_noticia"], name['FLG_PESSOA_PUBLICA'],
-                existem_processos, origem_uf, tribunais, links_tribunais, tipo_informacao,
-                name['ANIVERSARIO'], values_base["texto"], name['INDICADOR_PPE'], pep_relacionado,
-                values_base["url"], orgao, empresa_relacionada, cnpj_empresa_relacionada,
-                relacionamento, data_inicio_mandato, data_fim_mandato, data_carencia
+        for i in range(0, len(batch), chunk_size):
+            sub = batch[i:i+chunk_size]
+            try:
+                cursor.executemany(insert_sql, sub)
+                conn.commit()
+                inserted += len(sub)
+            except Exception as e:
+                logger.warning(f"[aux] falha no sublote {i}-{i+len(sub)}: {e} (fallback por linha)")
+                conn.rollback()
+                # fallback resiliente: transações curtíssimas por linha
+                conn.autocommit = True
+                for vals in sub:
+                    try:
+                        cursor.execute(insert_sql, vals)
+                        inserted += 1
+                    except Exception as ee:
+                        logger.error(f"[aux] falhou 1 linha no fallback: {ee}")
+                conn.autocommit = False
+
+        # marca a notícia
+        try:
+            cursor.execute(
+                "UPDATE TB_NOTICIA_RASPADA SET STATUS=%s, DT_TRANSFERENCIA=NOW() WHERE ID=%s",
+                ("203-PUBLISHED" if inserted > 0 else "205-TRANSFERED", news.get("ID"))
             )
-            try:
-                cursor.execute(insert_query, values)
-                inserted += 1
-            except Exception as err:
-                logger.error(f"Erro ao inserir '{name['NOME']}' (notícia {news.get('ID')}): {err}")
+            conn.commit()
+        except Exception as e:
+            logger.error(f"[aux] falhou UPDATE status da notícia {news.get('ID')}: {e}")
+            conn.rollback()
 
-        # se inseriu algo, marca como publicado
-        if inserted > 0:
-            try:
-                cursor.execute(
-                    "UPDATE TB_NOTICIA_RASPADA SET STATUS=%s, DT_TRANSFERENCIA=NOW() WHERE ID=%s",
-                    ("203-PUBLISHED", news.get("ID"))
-                )
-            except Exception as err:
-                logger.error(f"Erro ao atualizar notícia {news.get('ID')} para 203-PUBLISHED: {err}")
-
-        conn.commit()
         return inserted, inserted > 0
 
-    except Exception as err:
-        logger.error(f"Erro ao inserir na Auxiliar (notícia {news.get('ID')}): {err}")
-        return 0, False
     finally:
-        try:
-            cursor.close(); conn.close()
-        except Exception:
-            pass
+        try: cursor.close()
+        except: pass
+        try: conn.close()
+        except: pass
 
 def run_transfer(date_directory: str | None, category: str | None, logger):
     # data default = hoje (YYYYMMDD)
     date_dir = date_directory or datetime.now().strftime("%Y%m%d")
     logger.info(f"Iniciando transferência (modo por notícia) DATE_DIRECTORY={date_dir} CATEGORY={category}")
 
-    # # filtro por REG_NOTICIA LIKE, baseado na categoria + data
-    # reg_like = None
+    # filtro por REG_NOTICIA LIKE (categoria + data)
+    reg_like = None
     if category:
         try:
             abrev, cat_prefix, full_name = normalize_category(category)
             if not cat_prefix:
                 raise ValueError(f"Prefixo não mapeado para categoria: {category}")
-            reg_like = f"{cat_prefix}{date_dir}%"  # ex.: "C20250817%"
+            reg_like = f"{cat_prefix}{date_dir}%"
             logger.info(f"Filtro: REG_NOTICIA LIKE '{reg_like}' ({full_name}/{abrev})")
         except ValueError as e:
             logger.error(str(e))
             return {"date": date_dir, "moved": 0, "failed": 0, "inserted": 0,
                     "published": [], "not_published": [], "error": str(e)}
-    #
+
     # 1) carrega todas as 201-APPROVED (com filtro opcional)
     registros = fetch_registros(logger, reg_like=reg_like)
-    print('registros::::::',len(registros))
+    logger.info(f"Registros para processar: {len(registros)}")
     if not registros:
-        logger.info("Nenhum registro para processar com os filtros informados.")
         return {"date": date_dir, "moved": 0, "failed": 0, "inserted": 0,
-                "published": [], "not_published": []}
+                "published": [], "not_published": [], "scheduled": []}
 
     moved, failed = [], []
-    published, not_published = [], []
-    total_inserted = 0
+    scheduled = []
 
-    registros2 = [registros[1]]
-    #
-    # # 2) processa CADA notícia: transferir ➜ inserir nomes ➜ publicar
-    for reg in registros2:
-        print('registro id::', reg['ID'])
-        print('date_dir::::', date_dir)
+    # 2) processa CADA notícia: transferir ➜ agendar inserção de nomes
+    for reg in registros:
         lp, rd = construir_caminhos(reg, date_dir)
-
-        print('lp::::', lp)
-        print('rd::::', rd)
 
         # 2.1 transferir essa notícia
         if transferir_arquivo(lp, rd, reg['ID'], logger):
             moved.append(reg['REG_NOTICIA'])
         else:
             failed.append(reg['REG_NOTICIA'])
-            # sem transferência, não tenta inserir nomes
             continue
-        #
-        # # 2.2 carregar nomes dessa notícia
-        # names = fetch_nomes_por_noticia(reg['ID'], logger)
-        #
-        # # 2.3 montar estrutura 'news' mínima p/ insert
-        # news = {
-        #     'ID': reg['ID'],
-        #     'LINK_ID': reg.get('LINK_ID'),
-        #     'URL': reg.get('URL'),
-        #     'FONTE': reg.get('FONTE'),
-        #     'DATA_PUBLICACAO': reg.get('DATA_PUBLICACAO'),
-        #     'CATEGORIA': reg.get('CATEGORIA'),
-        #     'REG_NOTICIA': reg.get('REG_NOTICIA'),
-        #     'TEXTO_NOTICIA': reg.get('TEXTO_NOTICIA'),
-        #     'UF': reg.get('UF'),
-        #     'REGIAO': reg.get('REGIAO'),
-        #     'OPERACAO': reg.get('OPERACAO'),
-        #     'TITULO': reg.get('TITULO'),
-        # }
-        #
-        # # 2.4 inserir nomes dessa notícia na Auxiliar
-        # inserted_count, published_flag = insert_names_to_aux_for_news(news, names, logger)
-        # total_inserted += inserted_count
-        # if published_flag:
-        #     published.append(reg['ID'])
-        # else:
-        #     not_published.append(reg['ID'])
+
+        # 2.2 agendar inserção na fila dedicada (assíncrono)
+        async_result = insert_names_task.delay(reg['ID'])
+        scheduled.append({"news_id": reg["ID"], "task_id": async_result.id})
 
     summary = {
         "date": date_dir,
         "moved": len(moved),
         "failed": len(failed),
-        "inserted": total_inserted,
-        "published": published,
-        "not_published": not_published,
+        "inserted": 0,             # inserção é assíncrona agora
+        "published": [],           # será marcado pelo task de insert
+        "not_published": [],       # idem
+        "scheduled": scheduled,    # lista de tasks enfileiradas
     }
     logger.info(f"Resumo: {summary}")
     return summary
+
+@celery_app.task(
+    name="dtecflex.insert_names",
+    queue="aux-insert",
+    acks_late=True,
+    soft_time_limit=5*60,
+    time_limit=5*60,
+    max_retries=0,
+)
+def insert_names_task(news_id: int):
+    # Busca news + names "frescos" no momento da execução
+    news = load_news(news_id)
+    # logger pode ser global/importado; se não tiver, substitua por um stub
+    from src.dtecflex_extract_api.config.celery import logger  # ajuste se necessário
+    names = fetch_nomes_por_noticia(news_id, logger)
+    return insert_names_to_aux_for_news(news, names, logger)

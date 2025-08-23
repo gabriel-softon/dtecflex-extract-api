@@ -272,6 +272,8 @@ def listar_noticias_por_current_user(
 
     noticias, total_count = noticia_service.list(offset=None, limit=None, filters=filters)
 
+    print('noticias', noticias)
+
     grouped: Dict[str, List[NoticiaRaspadaModel]] = defaultdict(list)
     for noticia in noticias:
         grouped[noticia.STATUS].append(noticia)
