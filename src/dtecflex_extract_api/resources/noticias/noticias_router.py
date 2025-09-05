@@ -1,4 +1,6 @@
 from collections import defaultdict
+from dtecflex_extract_api.services.transfer_service import normalize_category
+from dtecflex_extract_api.utils.pubsub import META_PREFIX, acquire_lock, get_meta, job_key, lock_key, meta_key, publish, save_meta, r_sync
 import requests
 from celery.result import AsyncResult
 from fastapi import HTTPException, status, Request
@@ -105,6 +107,27 @@ def create_noticia_nome(
     except Exception as e:
         print('err', e)
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/verify-status-and-user/{id}")
+def verify_status(
+    id: int,
+    noticia_service: NoticiaService = Depends(get_noticia_service),
+    current_user: UsuarioModel = Depends(get_current_user),
+):
+    condicao = False
+
+    noticia = noticia_service.get_by_id(id)
+
+    if noticia.ID_USUARIO == current_user.ID:
+        condicao = True
+
+    if not noticia.ID_USUARIO:
+        condicao = True
+
+    return {
+        "habilitado": condicao
+    }
+
 
 @router.delete("/nome/{nome_id}", status_code=204)
 def delete_noticia_nome(
@@ -455,13 +478,191 @@ def debug():
     }
 
 
+@router.get("/por-data-categoria")
+def list_noticias_por_data_categoria(
+    request: Request,
+    date: str = Query(..., description="Data no formato YYYY-MM-DD"),
+    category: str = Query(..., description="Nome ou abreviação: Crime|CR, Lavagem de Dinheiro|LD, Fraude|FF, Empresarial|SE, Ambiental|SA"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1),
+    status: Optional[List[str]] = Query(["201-APPROVED", "203-PUBLISHED"], alias="status"),
+    incluir_aux: bool = Query(True, description="Se True, anexa registros da tabela Auxiliar em aux_registros"),
+    noticia_service: NoticiaService = Depends(get_noticia_service),
+    # current_user: UsuarioModel = Depends(get_current_user),
+):
+    # valida data
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d")
+        yyyymmdd = d.strftime("%Y%m%d")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="`date` deve estar no formato YYYY-MM-DD.")
+
+    # normaliza categoria → (abrev, prefixo, nome)
+    try:
+        abrev, cat_prefix, full_name = normalize_category(category)
+        if not cat_prefix:
+            raise ValueError(f"Categoria sem prefixo mapeado: {category}")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    lo = f"{cat_prefix}{yyyymmdd}"
+    hi = f"{lo}\uffff"
+
+    if status and len(status) == 1 and "," in status[0]:
+        status = [s.strip() for s in status[0].split(",") if s.strip()]
+
+    offset = (page - 1) * limit
+
+    filters: Dict[str, Any] = {
+        "REG_NOTICIA_RANGE": (lo, hi),
+        "CATEGORIA": full_name,   # ✅ usa o nome canônico ("Fraude", "Crime", etc.)
+    }
+    if status:
+        filters["STATUS"] = status
+
+    noticias, total_count = noticia_service.list(
+        offset=offset,
+        limit=limit,
+        filters=filters,
+        incluir_aux=incluir_aux,  # pode ligar/desligar pelo query param
+    )
+
+    total_pages = (total_count + limit - 1) // limit
+
+    # regra de exibição: PUBLISHED sem aux_registros => mostrar como APPROVED
+    for i in noticias:
+        if i.STATUS == '203-PUBLISHED' and not getattr(i, 'aux_registros', []):
+            i.STATUS = '201-APPROVED'
+
+    next_url = str(request.url.include_query_params(page=page + 1, limit=limit)) if page < total_pages else None
+    prev_url = str(request.url.include_query_params(page=page - 1, limit=limit)) if page > 1 else None
+
+    return {
+        "total_count": total_count,
+        "total_pages": total_pages,
+        "page": page,
+        "next": next_url,
+        "previous": prev_url,
+        "noticias": noticias,
+    }
+
+@router.get("/transfer/active")
+def get_active_transfers(
+    date: Optional[str] = Query(default=None, pattern=r"^\d{8}$"),
+    category: Optional[str] = Query(default=None)
+):
+    """
+    Lista jobs ativos. Opcionalmente filtra por (date, category).
+    Resposta compatível com o front: { "active": [...] }
+    """
+    return { "active": _list_active_jobs(date, category) }
+
 @router.post("/transfer")
 def trigger_transfer(
     date: str | None = Query(default=None, pattern=r"^\d{8}$"),
-    category: str | None = Query(
-        default=None,
-        description="Nome ou abreviação: Crime|CR, Lavagem de Dinheiro|LD, Fraude|FF, Empresarial|SE, Ambiental|SA",
-    ),
+    category: str | None = Query(default=None)
 ):
-    job = transfer_task.delay(date_directory=date, category=category)
-    return {"task_id": job.id, "message": "transfer agendada", "date": date, "category": category}
+    date_dir = date or datetime.now().strftime("%Y%m%d")
+    abrev, cat_prefix, full = normalize_category(category) if category else (None, None, None)
+    key = job_key(date_dir, abrev, cat_prefix)
+
+    # tenta obter o lock (bloqueia duplicatas)
+    if not acquire_lock(key):
+        meta = {"state": "RUNNING"}
+        # 409: já em execução
+        raise HTTPException(status_code=409, detail={
+            "message": "Publicação já em andamento para esta data/categoria.",
+            "date": date_dir, "category": category, "key": key, **meta
+        })
+
+    # agenda a task
+    job = transfer_task.apply_async(kwargs={"date_directory": date_dir, "category": category, "job_key": key}, queue="transfer")
+
+    # meta inicial + broadcast inicial
+    payload = {"event": "ENQUEUED", "task_id": job.id, "progress": 0, "state": "QUEUED", "date": date_dir, "category": category, "key": key}
+    save_meta(key, **payload)
+    publish(key, payload)
+
+    return {"task_id": job.id, "message": "transfer agendada", "date": date_dir, "category": category, "key": key}
+
+def _parse_int(x, default=0):
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+def _list_active_jobs(date: Optional[str]=None, category: Optional[str]=None) -> List[Dict[str, Any]]:
+    # Se filtrar por data+categoria, montamos a chave exata; senão, varremos todas
+    keys: List[str] = []
+    if date and category:
+        abrev, cat_prefix, _ = normalize_category(category)
+        k = job_key(date, abrev, cat_prefix)  # ex.: C20250905
+        keys = [meta_key(k)]
+    else:
+        # scan seguro (evita KEYS *)
+        for k in r_sync.scan_iter(f"{META_PREFIX}*"):
+            keys.append(k)
+
+    active: List[Dict[str, Any]] = []
+    for mk in keys:
+        meta = r_sync.hgetall(mk) or {}
+        if not meta:
+            continue
+
+        # campos podem vir como string (pois Redis); normalizamos o essencial
+        progress = _parse_int(meta.get("progress", 0))
+        state    = meta.get("state") or meta.get("phase") or ""
+        event    = meta.get("event") or ""
+        date_str = meta.get("date") or ""
+        cat      = meta.get("category") or ""
+        jk       = mk.replace(META_PREFIX, "")
+
+        # considerar ativo se não terminou nem falhou
+        finished = (event == "DONE" or state == "DONE" or progress >= 100)
+        failed   = (event == "FAILED" or state == "FAILED")
+        if finished or failed:
+            continue
+
+        # opcional: só considera ativo se o lock ainda existir
+        # (comenta/ajusta se preferir não depender do lock)
+        if not r_sync.exists(lock_key(jk)):
+            # pode ter expirado lock mas ainda queremos listar -> comente este continue se necessário
+            continue
+
+        active.append({
+            "date": date_str,
+            "category": cat,
+            "progress": progress,
+            "state": state or event or "RUNNING",
+            "key": jk,
+        })
+    return active
+
+@router.get("/transfer/status")
+def get_transfer_status(
+    date: str = Query(..., pattern=r"^\d{8}$"),
+    category: str = Query(...),
+):
+    """
+    Snapshot do job (terminado ou não). Retorna o meta salvo no Redis.
+    """
+    try:
+        abrev, cat_prefix, _ = normalize_category(category)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    k = job_key(date, abrev, cat_prefix)
+    meta = get_meta(k) or {}
+    # normaliza tipos básicos
+    def _to_int(v, d=0):
+        try: return int(float(v))
+        except: return d
+    meta_norm = {
+        "event": meta.get("event") or "",
+        "state": meta.get("state") or "",
+        "progress": _to_int(meta.get("progress", 0)),
+        "date": meta.get("date") or date,
+        "category": meta.get("category") or category,
+        "key": k,
+    }
+    return {"key": k, "meta": meta_norm}

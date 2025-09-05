@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime
-from sqlalchemy import and_, text, func
+from sqlalchemy import and_, case, text, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 from src.dtecflex_extract_api.resources.noticias.entities.noticia_raspada import NoticiaRaspadaModel, \
@@ -99,6 +99,17 @@ class NoticiaService:
         else:
             self.prompt = self.prompt_not_ambiental
 
+    def get_by_id(self, id: int):
+        noticia = (
+            self.session
+                .query(NoticiaRaspadaModel)
+                .filter(NoticiaRaspadaModel.ID == id)
+                .first()
+        )
+        if not noticia:
+            raise Exception("Noticia não encontrada")
+        return noticia
+
     def create_nome(self, schema) -> NoticiaRaspadaNomeModel:
         obj = NoticiaRaspadaNomeModel(
             NOTICIA_ID         = schema.noticia_id,
@@ -164,9 +175,17 @@ class NoticiaService:
             self.session.rollback()
             raise ValueError("LINK_ID já existe (URL duplicada).") from e
 
-    def list(self, offset: int = 0, limit: int = 10, filters: Optional[Dict[str, Any]] = None) -> Tuple[
-        List[NoticiaRaspadaModel], int]:
-        query = self.session.query(NoticiaRaspadaModel).options(joinedload(NoticiaRaspadaModel.nomes_raspados))
+    def list(
+        self,
+        offset: int = 0,
+        limit: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+        incluir_aux: bool = False,
+    ) -> Tuple[List[NoticiaRaspadaModel], int]:
+        query = (
+            self.session.query(NoticiaRaspadaModel)
+            .options(joinedload(NoticiaRaspadaModel.nomes_raspados))
+        )
 
         if filters:
             filter_conditions = []
@@ -176,23 +195,17 @@ class NoticiaService:
 
             if 'DT_APROVACAO' in filters:
                 data_inicio, data_fim = filters['DT_APROVACAO']
-
                 if data_inicio and data_fim:
-                    filter_conditions.append(
-                        NoticiaRaspadaModel.DT_APROVACAO.between(data_inicio, data_fim)
-                    )
+                    filter_conditions.append(NoticiaRaspadaModel.DT_APROVACAO.between(data_inicio, data_fim))
                 elif data_inicio:
                     filter_conditions.append(NoticiaRaspadaModel.DT_APROVACAO >= data_inicio)
                 elif data_fim:
                     filter_conditions.append(NoticiaRaspadaModel.DT_APROVACAO <= data_fim)
-            # Filtro de data
+
             if 'DATA_PUBLICACAO' in filters:
                 data_inicio, data_fim = filters['DATA_PUBLICACAO']
-
                 if data_inicio and data_fim:
-                    filter_conditions.append(
-                        NoticiaRaspadaModel.DATA_PUBLICACAO.between(data_inicio, data_fim)
-                    )
+                    filter_conditions.append(NoticiaRaspadaModel.DATA_PUBLICACAO.between(data_inicio, data_fim))
                 elif data_inicio:
                     filter_conditions.append(NoticiaRaspadaModel.DATA_PUBLICACAO >= data_inicio)
                 elif data_fim:
@@ -200,13 +213,22 @@ class NoticiaService:
 
             if 'FONTE' in filters and filters['FONTE']:
                 filter_conditions.append(NoticiaRaspadaModel.FONTE.ilike(f"%{filters['FONTE']}%"))
+
             if 'CATEGORIA' in filters and filters['CATEGORIA']:
                 filter_conditions.append(NoticiaRaspadaModel.CATEGORIA == filters['CATEGORIA'])
+
             if 'SUBCATEGORIA' in filters and filters['SUBCATEGORIA']:
                 subcategorias = " ".join(filters['SUBCATEGORIA'])
                 query = query.filter(
-                    text(f"MATCH(QUERY) AGAINST (:subcategorias IN BOOLEAN MODE)")
+                    text("MATCH(QUERY) AGAINST (:subcategorias IN BOOLEAN MODE)")
                 ).params(subcategorias=subcategorias)
+
+            if 'REG_NOTICIA_RANGE' in filters and filters['REG_NOTICIA_RANGE']:
+                lo, hi = filters['REG_NOTICIA_RANGE']
+                query = query.filter(
+                    NoticiaRaspadaModel.REG_NOTICIA >= lo,
+                    NoticiaRaspadaModel.REG_NOTICIA < hi
+                )
 
             if 'USUARIO_ID' in filters and filters['USUARIO_ID']:
                 filter_conditions.append(NoticiaRaspadaModel.ID_USUARIO == filters['USUARIO_ID'])
@@ -215,10 +237,22 @@ class NoticiaService:
                 query = query.filter(and_(*filter_conditions))
 
         total_count = query.count()
+        noticias = (
+            query.order_by(NoticiaRaspadaModel.ID.desc())
+                 .offset(offset)
+                 .limit(limit)
+                 .all()
+        )
 
-        query = query.order_by(NoticiaRaspadaModel.ID.desc()).offset(offset).limit(limit)
-        return query.all(), total_count
+        if incluir_aux and noticias:
+            registros = [n.REG_NOTICIA for n in noticias if getattr(n, "REG_NOTICIA", None)]
+            aux_por_reg = self._fetch_aux_by_registros(registros)
 
+            for n in noticias:
+                setattr(n, "aux_registros", aux_por_reg.get(n.REG_NOTICIA, []))
+
+        return noticias, total_count
+    
     def update(self, id: int, data: Dict[str, Any]) -> NoticiaRaspadaModel:
         noticia = (
             self.session
@@ -588,3 +622,25 @@ class NoticiaService:
         if isinstance(v, str):
             return v.strip() == '1'
         return None
+    
+    def _fetch_aux_by_registros(self, registros: List[str], batch_size: int = 1000) -> Dict[str, List[Dict[str, Any]]]:
+        if not registros:
+            return {}
+
+        uniq = list(dict.fromkeys(registros))
+        agrupado: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+        for start in range(0, len(uniq), batch_size):
+            batch = uniq[start:start + batch_size]
+
+            placeholders = ", ".join(f":p{i}" for i in range(len(batch)))
+            sql = text(f"SELECT * FROM Auxiliar WHERE REGISTRO_NOTICIA IN ({placeholders})")
+
+            params = {f"p{i}": val for i, val in enumerate(batch)}
+            result = self.session.execute(sql, params)
+
+            for row in result.mappings():
+                reg = row.get("REGISTRO_NOTICIA")
+                agrupado[reg].append(dict(row))
+
+        return agrupado

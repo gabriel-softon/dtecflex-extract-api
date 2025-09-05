@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -94,6 +94,7 @@ class NoticiaRaspadaSchema(NoticiaRaspadaBaseSchema):
     UF: Optional[str] = Field(None, max_length=200)
     REGIAO: Optional[str] = Field(None, max_length=200)
     mensagens: Optional[list] = None
+    aux_registros: List[Dict[str, Any]] = Field(default_factory=list)
     nomes_raspados: Optional[list[NomeRaspadoSchema]] = None
 
     model_config = ConfigDict(from_attributes=True)

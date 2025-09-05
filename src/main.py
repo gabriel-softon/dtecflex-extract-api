@@ -4,6 +4,7 @@ from fastapi.security import OAuth2PasswordBearer
 
 from src.dtecflex_extract_api.resources.noticias.noticias_router import router as noticias_router
 from src.dtecflex_extract_api.resources.auth.auth_router import router as auth_router
+from src.dtecflex_extract_api.resources.ws.ws_router import router as ws_router
 
 app = FastAPI(
     title="Relações PEP API",
@@ -23,4 +24,5 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 api = APIRouter(prefix="/api")
 api.include_router(noticias_router, prefix="/noticias", tags=["Notícias"])
 api.include_router(auth_router,     prefix="/auth",     tags=["Auth"])
+api.include_router(ws_router,       tags=["WebSocket"])
 app.include_router(api)
