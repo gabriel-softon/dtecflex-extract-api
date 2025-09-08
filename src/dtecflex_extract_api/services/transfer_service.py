@@ -8,7 +8,6 @@ import mysql.connector
 
 from src.dtecflex_extract_api.config.celery import settings
 ProgressCb = Optional[Callable[[int, int, str, dict | None], None]]
-# Mapeamentos
 CAT_ABREV = {
     'Lavagem de Dinheiro': 'LD',
     'Crime':               'CR',
@@ -40,10 +39,10 @@ def normalize_category(cat: str) -> tuple[str, str, str]:
     if not cat:
         raise ValueError("Categoria vazia.")
     cat = cat.strip()
-    if cat in CAT_ABREV:  # nome por extenso
+    if cat in CAT_ABREV:
         abrev = CAT_ABREV[cat]
         return abrev, CAT_PREFIX.get(abrev), cat
-    abrev = cat.upper()   # abreviação (CR, LD, FF, SE, SA)
+    abrev = cat.upper()
     if abrev in INV_CAT_ABREV:
         return abrev, CAT_PREFIX.get(abrev), INV_CAT_ABREV[abrev]
     raise ValueError(f"Categoria inválida: {cat}")
@@ -134,8 +133,6 @@ def transferir_arquivo(local_pattern: str, remote_dir: str, noticia_id: int, log
     )
     logger.info(f"Executando rsync: {rsync_cmd}")
     result = subprocess.run(rsync_cmd, shell=True, capture_output=True, text=True)
-
-    print('result:::', result)
 
     if result.returncode == 0:
         try:

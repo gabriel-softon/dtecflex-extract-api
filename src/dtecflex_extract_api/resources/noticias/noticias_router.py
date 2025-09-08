@@ -3,13 +3,13 @@ from dtecflex_extract_api.services.transfer_service import normalize_category
 from dtecflex_extract_api.utils.pubsub import META_PREFIX, acquire_lock, get_meta, job_key, lock_key, meta_key, publish, save_meta, r_sync
 import requests
 from celery.result import AsyncResult
-from fastapi import HTTPException, status, Request
+from fastapi import Body, HTTPException, status, Request
 from pydantic import BaseModel, Field
 
 from src.dtecflex_extract_api.config.celery import celery_app
-from src.dtecflex_extract_api.resources.noticias.entities.noticia_raspada import NoticiaRaspadaModel
+from src.dtecflex_extract_api.resources.noticias.entities.noticia_raspada import NoticiaRaspadaModel, NoticiaRaspadaNomeModel
 from src.dtecflex_extract_api.resources.noticias.schemas.noticia_create import NoticiaCreate
-from src.dtecflex_extract_api.resources.noticias.schemas.noticia_nome_update import NoticiaNomesBatchUpdateIn
+from src.dtecflex_extract_api.resources.noticias.schemas.noticia_nome_update import NoticiaNomePartialUpdate, NoticiaNomesBatchUpdateIn
 from src.dtecflex_extract_api.resources.usuario.entities.usuario import UsuarioModel
 from src.dtecflex_extract_api.shared.utils.get_current_user import get_current_user
 import xml.etree.ElementTree as ET
@@ -105,7 +105,6 @@ def create_noticia_nome(
             # "envolvimento_gov":     True  if new.ENVOLVIMENTO_GOV     == "1" else False,
         }
     except Exception as e:
-        print('err', e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/verify-status-and-user/{id}")
@@ -263,7 +262,6 @@ def buscar_dtec(
 def aprovar_noticias(
     payload: AprovarNoticiasIn,
     noticia_service: NoticiaService = Depends(get_noticia_service),
-    current_user: UsuarioModel = Depends(get_current_user)
 ) -> Dict[str, Any]:
     """
     Recebe uma lista de IDs e aprova todas as notícias correspondentes.
@@ -273,9 +271,7 @@ def aprovar_noticias(
         result = noticia_service.aprovar_em_lote(payload.ids)
         return result
     except Exception as e:
-        # registre/log o erro se desejar
         raise HTTPException(status_code=500, detail="Erro ao aprovar notícias em lote.")
-
 
 @router.get("/me")
 def listar_noticias_por_current_user(
@@ -294,8 +290,6 @@ def listar_noticias_por_current_user(
         filters['STATUS'] = status
 
     noticias, total_count = noticia_service.list(offset=None, limit=None, filters=filters)
-
-    print('noticias', noticias)
 
     grouped: Dict[str, List[NoticiaRaspadaModel]] = defaultdict(list)
     for noticia in noticias:
@@ -333,7 +327,6 @@ def capturar_texto_noticia(
 
         return updated_noticia  # Retorna a notícia atualizada
     except Exception as e:
-        # Caso ocorra algum erro, lança uma exceção HTTP
         raise HTTPException(status_code=500, detail=f"Erro ao capturar texto da notícia: {e}")
 
 @router.put("/{id}", response_model=dict)
@@ -346,8 +339,6 @@ def update_noticia(
         updated = noticia_service.update(id, payload.dict())
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
-
-    print('updated::', updated)
 
     return {
         "url": updated.URL,
@@ -375,7 +366,6 @@ def set_user_id(
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    print('updated::', updated)
 
     return {
         "url": updated.URL,
@@ -408,10 +398,40 @@ def update_nomes_batch(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        print('aaaaaaaaaaaaa')
-        print(e)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.put("/nome/{nome_id}", response_model=NoticiaNomeResponse)
+def update_noticia_nome(
+    nome_id: int,
+    payload: NoticiaNomePartialUpdate = Body(...),  # força vir no body
+    noticia_service: NoticiaService = Depends(get_noticia_service)
+):
+    try:
+        updated = noticia_service.update_nome(nome_id, payload)
+        return {
+            "id":                   updated.ID,
+            "noticia_id":           updated.NOTICIA_ID,
+            "nome":                 updated.NOME,
+            "cpf":                  updated.CPF,
+            "apelido":              updated.APELIDO,
+            "nome_cpf":             updated.NOME_CPF,
+            "operacao":             updated.OPERACAO,
+            "sexo":                 updated.SEXO,
+            "pessoa":               updated.PESSOA,
+            "idade":                updated.IDADE,
+            "atividade":            updated.ATIVIDADE,
+            "envolvimento":         updated.ENVOLVIMENTO,
+            "tipo_suspeita":        updated.TIPO_SUSPEITA,
+            "flg_pessoa_publica":   True if updated.FLG_PESSOA_PUBLICA == "1" else False,
+            "aniversario":          updated.ANIVERSARIO,
+            "indicador_ppe":        True if updated.INDICADOR_PPE == "1" else False,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @router.get("/get-by-reg/{reg}")
 def get_por_reg_noticia(
         reg: str,

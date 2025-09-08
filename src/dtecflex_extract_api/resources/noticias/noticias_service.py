@@ -2,6 +2,8 @@ import json
 import os
 import uuid
 from collections import defaultdict
+from dtecflex_extract_api.resources.noticias.schemas.noticia_create import NoticiaCreate
+from dtecflex_extract_api.resources.noticias.schemas.noticia_nome_update import NoticiaNomePartialUpdate
 import trafilatura
 import requests
 from bs4 import BeautifulSoup
@@ -171,7 +173,6 @@ class NoticiaService:
             self.session.refresh(entity)
             return entity
         except IntegrityError as e:
-            print('error:::',e)
             self.session.rollback()
             raise ValueError("LINK_ID já existe (URL duplicada).") from e
 
@@ -351,6 +352,42 @@ class NoticiaService:
             "skipped": skipped
         }
 
+    def update_nome(self, nome_id: int, dto: "NoticiaNomePartialUpdate") -> NoticiaRaspadaNomeModel:
+        # garante que o ID do body confere com a rota (já que seu schema exige id)
+        if dto.id != nome_id:
+            raise ValueError("ID do payload não confere com o ID da rota.")
+
+        obj = (
+            self.session
+            .query(NoticiaRaspadaNomeModel)
+            .filter(NoticiaRaspadaNomeModel.ID == nome_id)
+            .first()
+        )
+        if not obj:
+            raise ValueError(f"Nome com ID {nome_id} não encontrado")
+
+        # Compatível com Pydantic v1 e v2
+        fields_set = getattr(dto, 'model_fields_set', getattr(dto, '__fields_set__', set()))
+
+        # atualiza apenas os campos presentes no payload
+        if 'nome' in fields_set:                 obj.NOME  = dto.nome
+        if 'cpf' in fields_set:                  obj.CPF   = dto.cpf
+        if 'apelido' in fields_set:              obj.APELIDO = dto.apelido
+        if 'nome_cpf' in fields_set:             obj.NOME_CPF = dto.nome_cpf
+        if 'operacao' in fields_set:             obj.OPERACAO = dto.operacao
+        if 'sexo' in fields_set:                 obj.SEXO  = dto.sexo   # 'F'|'M'|None
+        if 'pessoa' in fields_set:               obj.PESSOA = dto.pessoa # 'PF'|'PJ'|None
+        if 'idade' in fields_set:                obj.IDADE = dto.idade
+        if 'atividade' in fields_set:            obj.ATIVIDADE = dto.atividade
+        if 'envolvimento' in fields_set:         obj.ENVOLVIMENTO = dto.envolvimento
+        if 'tipo_suspeita' in fields_set:        obj.TIPO_SUSPEITA = dto.tipo_suspeita
+        if 'flg_pessoa_publica' in fields_set:   obj.FLG_PESSOA_PUBLICA = self._bool_to_flag(dto.flg_pessoa_publica)
+        if 'indicador_ppe' in fields_set:        obj.INDICADOR_PPE      = self._bool_to_flag(dto.indicador_ppe)
+        if 'aniversario' in fields_set:          obj.ANIVERSARIO        = dto.aniversario  # date|None
+
+        self.session.commit()
+        self.session.refresh(obj)
+        return obj
     def aprovar_em_lote(self, ids: List[int]) -> Dict[str, Any]:
         ids = list({int(i) for i in ids if i is not None})
 
