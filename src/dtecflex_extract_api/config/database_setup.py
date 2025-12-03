@@ -4,13 +4,17 @@ from dotenv import find_dotenv, load_dotenv
 
 dotenv_path = find_dotenv()
 
+if not dotenv_path:
+    docker_env_path = '/app/.env'
+    if os.path.exists(docker_env_path):
+        dotenv_path = docker_env_path
+        print(f'.env file found in Docker location: {dotenv_path}')
+
 if dotenv_path:
-    load_dotenv(dotenv_path, override=True)
-    # logger.info(f'.env file found and loaded: {dotenv_path}')
+    load_dotenv(dotenv_path, override=False)
     print(f'.env file found and loaded: {dotenv_path}')
-else:
-    #logger.error('.env file not found')
-    print('.env file not found')
+elif not os.getenv('DB_HOST'):
+    print('.env file not found, using environment variables')
 
 
 def build_connection_url():

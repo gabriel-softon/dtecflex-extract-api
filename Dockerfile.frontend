@@ -1,0 +1,35 @@
+FROM node:20-slim
+
+ENV NODE_ENV=development
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=America/Sao_Paulo
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+WORKDIR /app
+
+COPY dtecflex-extract-front/package.json dtecflex-extract-front/package-lock.json* ./
+COPY dtecflex-extract-front/*.tgz ./
+
+RUN npm ci
+
+COPY dtecflex-extract-front/ ./
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iputils-ping \
+    dnsutils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY dtecflex-extract-front/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 4200
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+CMD ["npm", "start", "--", "--host", "0.0.0.0", "--disable-host-check"]
+

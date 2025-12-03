@@ -1,0 +1,79 @@
+# Arquivos e diretórios a serem ignorados no build Docker
+# Isso acelera o build e reduz o tamanho do contexto
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.node_repl_history
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentação
+*.md
+README*
+
+# Logs
+*.log
+logs/
+
+# Arquivos temporários
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Arquivos de deploy
+deploy_*.sh
+*.sh
+
+# Arquivos de ambiente (não devem estar no container)
+.env
+.env.local
+.env.*.local
+
+# Testes
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Outros
+*.tgz
+*.tar.gz
+
+

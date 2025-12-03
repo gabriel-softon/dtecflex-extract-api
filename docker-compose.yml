@@ -1,0 +1,85 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: dtecflex-redis
+    network_mode: bridge
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: dtecflex-api
+    ports:
+      - "7373:7373"
+    volumes:
+      - ./src:/app/src
+      - ./pyproject.toml:/app/pyproject.toml
+    env_file:
+      - .env
+    environment:
+      - CELERY_BROKER_URL=redis://dtecflex-redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://dtecflex-redis:6379/1
+      - DB_HOST=${DB_HOST:-host.docker.internal}
+    depends_on:
+      redis:
+        condition: service_healthy
+    network_mode: bridge
+    links:
+      - redis:dtecflex-redis
+    command: poetry run python -m uvicorn src.main:app --host 0.0.0.0 --port 7373 --reload
+
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: dtecflex-celery
+    volumes:
+      - ./src:/app/src
+      - ./pyproject.toml:/app/pyproject.toml
+    env_file:
+      - .env
+    environment:
+      - CELERY_BROKER_URL=redis://dtecflex-redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://dtecflex-redis:6379/1
+      - DB_HOST=${DB_HOST:-host.docker.internal}
+    depends_on:
+      redis:
+        condition: service_healthy
+    network_mode: bridge
+    links:
+      - redis:dtecflex-redis
+    command: poetry run celery -A src.dtecflex_extract_api.config.celery.celery_app worker -l info -E
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: dtecflex-frontend
+    ports:
+      - "4200:4200"
+    volumes:
+      - ./dtecflex-extract-front/src:/app/src
+      - ./dtecflex-extract-front/angular.json:/app/angular.json
+      - ./dtecflex-extract-front/tsconfig.json:/app/tsconfig.json
+      - ./dtecflex-extract-front/tsconfig.app.json:/app/tsconfig.app.json
+      - ./dtecflex-extract-front/src/environments/environment.docker.ts:/app/src/environments/environment.ts
+    environment:
+      - NODE_ENV=development
+    depends_on:
+      - api
+    network_mode: bridge
+    links:
+      - api:dtecflex-api
+
+volumes:
+  redis_data:
+

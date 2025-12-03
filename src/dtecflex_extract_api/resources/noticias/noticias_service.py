@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+import logging
 from collections import defaultdict
 from dtecflex_extract_api.resources.noticias.schemas.noticia_create import NoticiaCreate
 from dtecflex_extract_api.resources.noticias.schemas.noticia_nome_update import NoticiaNomePartialUpdate
@@ -21,67 +22,91 @@ import hashlib
 from xml.sax.saxutils import escape
 import xml.etree.ElementTree as ET
 
+logger = logging.getLogger(__name__)
+
 class NoticiaService:
     prompt_not_ambiental = """
-        Você atuará como um interpretador avançado de textos jornalísticos e checador de fatos, com foco em identificar nomes de pessoas ou entidades envolvidas em crimes ou outros atos ilicitos.
-        Seu objetivo é  localizar e extrair os nomes e as informações solicitadas, apresentando somente o resultado em formato de array JSON, onde cada nome será um elemento.
-        O texto a ser analisado será fornecido entre as tags artigo.
-        Para cada NOME, ENTIDADE ou EMPRESA encontrada no texto, resuma seu envolvimento em possíveis crimes.
-        Em seguida, classifique cada um conforme o contexto de envolvimento no texto, utilizando um dos seguintes termos: acusado, suspeito, investigado, denunciado, condenado, preso ou réu.
-        Inclua *APENAS* nomes próprios de pessoas, empresas ou entidades, evitando generalizações como função, profissão, etc.
+        Você atuará como um interpretador avançado de textos jornalísticos e checador de fatos, com foco em identificar nomes de PESSOAS FÍSICAS envolvidas em crimes ou outros atos ilícitos.
+        
+        IMPORTANTE: Você deve extrair APENAS PESSOAS FÍSICAS (indivíduos com nomes próprios). 
+        NÃO inclua organizações, empresas, órgãos públicos, ministérios, tribunais, departamentos ou outras entidades jurídicas.
+        Exemplos do que NÃO incluir: "Ministério Público", "Polícia Federal", "Tribunal de Justiça", "Empresa XYZ Ltda".
+        
+        Seu objetivo é localizar e extrair os nomes de PESSOAS FÍSICAS e as informações solicitadas, apresentando somente o resultado em formato de array JSON, onde cada nome será um elemento.
+        O texto a ser analisado será fornecido entre as tags <artigo>.
+        
+        Para cada PESSOA FÍSICA encontrada no texto:
+        1. Resuma seu envolvimento em possíveis crimes
+        2. Classifique conforme o contexto de envolvimento no texto, utilizando um dos seguintes termos: acusado, suspeito, investigado, denunciado, condenado, preso ou réu.
+        
+        Inclua *APENAS* nomes próprios de PESSOAS FÍSICAS, evitando generalizações como função, profissão, etc.
         Não incluir nos resultados pessoas que não estejam diretamente envolvidas ou suspeitas de crime.
         Não inclua nomes de vítimas ou pessoas mencionadas como vítimas.
         A resposta não deve conter nenhum outro texto ou formatação além de um array de objetos JSON.
 
         Cada elemento do array deve conter as seguintes propriedades, mesmo que o valor seja null:
 
-            NOME (nome da pessoa ou entidade encontrada na notícia)
-            CPF (CPF para pessoa física ou CNPJ para pessoa jurídica encontrada na notícia)
+            NOME (nome completo da PESSOA FÍSICA encontrada na notícia - OBRIGATÓRIO)
+            CPF (CPF da pessoa física, se encontrado no texto)
             APELIDO
             NOME_CPF (fixo null)
-            SEXO (usar 'M' para homens, 'F' para mulheres)
-            PESSOA ('F' para pessoa física 'J' para pessoa jurídica ou entidades)
+            SEXO (usar 'M' para homens, 'F' para mulheres, se identificável no texto)
+            PESSOA (SEMPRE 'F' para pessoa física - este campo é OBRIGATÓRIO e deve ser sempre 'F')
             IDADE (idade da pessoa, se encontrada no texto)
-            ANIVERSARIO (data de nascimento da pessoa, se encontrada no texto )
+            ANIVERSARIO (data de nascimento da pessoa, se encontrada no texto)
             ATIVIDADE (ocupação, cargo ou atividade principal da pessoa)
             ENVOLVIMENTO (termo de classificação: acusado, suspeito, investigado, denunciado, condenado, preso, réu)
-            OPERACAO (nome da operação policial ou judicial)
+            OPERACAO (nome da operação policial ou judicial, se mencionada)
             FLG_PESSOA_PUBLICA (fixo false)
             INDICADOR_PPE (fixo false)
             ENVOLVIMENTO_GOV (retornar true se houver envolvimento com governo, ou false)
 
-        Importante: Se não houver nenhum nome, retorne um array JSON vazio ( Exemplo: [] )
+        LEMBRE-SE: 
+        - O campo PESSOA deve ser SEMPRE 'F' (pessoa física)
+        - NÃO inclua organizações, órgãos públicos ou empresas
+        - Se não houver nenhuma pessoa física, retorne um array JSON vazio: []
     """
 
     prompt_is_ambiental = """
-        Você atuará como um interpretador avançado de textos jornalísticos e checador de fatos, com foco em identificar nomes de pessoas ou entidades envolvidas em atividades ambientais, incluindo crimes, infrações ou outros tipos de envolvimento com questões ambientais.
-        Seu objetivo é localizar e extrair os nomes e as informações solicitadas, apresentando somente o resultado em formato de array JSON, onde cada nome será um elemento.
-        O texto a ser analisado será fornecido entre as tags artigo.
-        Para cada NOME, ENTIDADE ou EMPRESA encontrada no texto, resuma seu envolvimento em possíveis crimes, infrações ambientais, projetos, denúncias ou outras questões relacionadas a atividades ambientais.
-        Em seguida, classifique cada um conforme o contexto de envolvimento no texto, utilizando um dos seguintes termos: acusado, suspeito, investigado, denunciado, condenado, preso, réu, envolvido, colaborador, responsável, líder, organizador, participante ou outros termos relacionados à categoria ambiental.
-        Inclua *APENAS* nomes próprios de pessoas, empresas ou entidades, evitando generalizações como função, profissão, etc.
+        Você atuará como um interpretador avançado de textos jornalísticos e checador de fatos, com foco em identificar nomes de PESSOAS FÍSICAS envolvidas em atividades ambientais, incluindo crimes, infrações ou outros tipos de envolvimento com questões ambientais.
+        
+        IMPORTANTE: Você deve extrair APENAS PESSOAS FÍSICAS (indivíduos com nomes próprios). 
+        NÃO inclua organizações, empresas, órgãos públicos, ministérios, tribunais, departamentos ou outras entidades jurídicas.
+        Exemplos do que NÃO incluir: "Ministério Público", "IBAMA", "Polícia Ambiental", "Empresa XYZ Ltda".
+        
+        Seu objetivo é localizar e extrair os nomes de PESSOAS FÍSICAS e as informações solicitadas, apresentando somente o resultado em formato de array JSON, onde cada nome será um elemento.
+        O texto a ser analisado será fornecido entre as tags <artigo>.
+        
+        Para cada PESSOA FÍSICA encontrada no texto:
+        1. Resuma seu envolvimento em possíveis crimes, infrações ambientais, projetos, denúncias ou outras questões relacionadas a atividades ambientais
+        2. Classifique conforme o contexto de envolvimento no texto, utilizando um dos seguintes termos: acusado, suspeito, investigado, denunciado, condenado, preso, réu, envolvido, colaborador, responsável, líder, organizador, participante ou outros termos relacionados à categoria ambiental.
+        
+        Inclua *APENAS* nomes próprios de PESSOAS FÍSICAS, evitando generalizações como função, profissão, etc.
         Não incluir nos resultados pessoas que não estejam diretamente envolvidas ou suspeitas de crimes ou infrações ambientais.
         Não inclua nomes de vítimas ou pessoas mencionadas como vítimas.
         A resposta não deve conter nenhum outro texto ou formatação além de um array de objetos JSON.
 
         Cada elemento do array deve conter as seguintes propriedades, mesmo que o valor seja null:
 
-            NOME (nome da pessoa ou entidade encontrada na notícia)
-            CPF (CPF para pessoa física ou CNPJ para pessoa jurídica encontrada na notícia)
+            NOME (nome completo da PESSOA FÍSICA encontrada na notícia - OBRIGATÓRIO)
+            CPF (CPF da pessoa física, se encontrado no texto)
             APELIDO
             NOME_CPF (fixo null)
-            SEXO (usar 'M' para homens, 'F' para mulheres)
-            PESSOA ('F' para pessoa física, 'J' para pessoa jurídica ou entidades)
+            SEXO (usar 'M' para homens, 'F' para mulheres, se identificável no texto)
+            PESSOA (SEMPRE 'F' para pessoa física - este campo é OBRIGATÓRIO e deve ser sempre 'F')
             IDADE (idade da pessoa, se encontrada no texto)
             ANIVERSARIO (data de nascimento da pessoa, se encontrada no texto)
             ATIVIDADE (ocupação, cargo ou atividade principal da pessoa)
             ENVOLVIMENTO (termo de classificação: acusado, suspeito, investigado, denunciado, condenado, preso, réu, envolvido, colaborador, responsável, líder, organizador, participante, etc.)
-            OPERACAO (nome da operação policial ou judicial, se houver)
+            OPERACAO (nome da operação policial ou judicial, se mencionada)
             FLG_PESSOA_PUBLICA (fixo false)
             INDICADOR_PPE (fixo false)
             ENVOLVIMENTO_GOV (retornar true se houver envolvimento com o governo, ou false)
 
-        Importante: Se não houver nenhum nome, retorne um array JSON vazio (Exemplo: []).
+        LEMBRE-SE: 
+        - O campo PESSOA deve ser SEMPRE 'F' (pessoa física)
+        - NÃO inclua organizações, órgãos públicos ou empresas
+        - Se não houver nenhuma pessoa física, retorne um array JSON vazio: []
     """
 
     def __init__(self, session: Session, user_agent=None, timeout=30, model: str = 'gpt-4o', notice_categoria: str = 'normal'):
@@ -477,6 +502,11 @@ class NoticiaService:
         return text or ""
 
     def extrair_nomes(self, id) -> list:
+        """
+        Extrai nomes de pessoas físicas de uma notícia usando GPT.
+        Retorna apenas entidades classificadas como pessoa física (PESSOA == 'F').
+        """
+        # Corrigido: verificar noticia ANTES de acessar seus atributos
         noticia = (
             self.session
                 .query(NoticiaRaspadaModel)
@@ -484,12 +514,19 @@ class NoticiaService:
                 .first()
         )
 
-        text = noticia.TEXTO_NOTICIA
         if not noticia:
-            raise Exception(f"Notícia com URL {id} não encontrada")
+            logger.error(f"Notícia com ID {id} não encontrada")
+            raise Exception(f"Notícia com ID {id} não encontrada")
+
+        text = noticia.TEXTO_NOTICIA
+        if not text or not text.strip():
+            logger.warning(f"Notícia {id} possui texto vazio ou None")
+            return []
 
         try:
             artigo = f"<artigo>\n{text}\n</artigo>"
+            logger.info(f"Iniciando extração de nomes para notícia {id} (texto com {len(text)} caracteres)")
+            
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -497,41 +534,161 @@ class NoticiaService:
                     {"role": "user", "content": artigo}
                 ]
             )
-            no_none_name = []
-
+            
             resposta = response.choices[0].message.content.strip()
+            logger.debug(f"Resposta GPT recebida (primeiros 500 chars): {resposta[:500]}")
 
-            print(f"Resposta recebida: {resposta}")
-
-            match = re.search(r'```json\s*(\[\s*{.*}\s*\])\s*```', resposta, re.DOTALL)
-            if match:
-                json_str = match.group(1)
-            else:
-                json_str = resposta
-
-            if json_str:
-                try:
-                    resposta_dict = json.loads(json_str)
-                except json.JSONDecodeError as json_err:
-                    print(f"Erro ao decodificar JSON: {json_err}")
-                    return []
-            else:
-                print("Resposta vazia ou formato inesperado.")
+            # Estratégias múltiplas para extrair JSON da resposta
+            json_str = self._extrair_json_da_resposta(resposta)
+            
+            if not json_str:
+                logger.warning(f"Não foi possível extrair JSON da resposta GPT para notícia {id}")
                 return []
 
-            if isinstance(resposta_dict, list):
-                for rd in resposta_dict:
-                    if rd.get('NOME'):
-                        no_none_name.append(rd)
-            else:
-                print("A resposta JSON não é uma lista conforme esperado.")
+            # Parse do JSON com tratamento de erros robusto
+            resposta_dict = self._parse_json_seguro(json_str, id)
+            if resposta_dict is None:
                 return []
 
-            return no_none_name
+            # Filtrar apenas pessoas físicas
+            nomes_filtrados = self._filtrar_pessoas_fisicas(resposta_dict, id)
+            
+            logger.info(f"Extraídos {len(nomes_filtrados)} nome(s) de pessoa(s) física(s) da notícia {id}")
+            if len(nomes_filtrados) == 0 and len(resposta_dict) > 0:
+                logger.warning(
+                    f"Nenhuma pessoa física encontrada, mas {len(resposta_dict)} entidade(s) foram retornadas. "
+                    f"Verifique se o campo PESSOA está sendo classificado corretamente."
+                )
+
+            return nomes_filtrados
 
         except Exception as e:
-            print(f"Exceção geral: {e}")
+            logger.error(f"Erro ao extrair nomes da notícia {id}: {e}", exc_info=True)
             return []
+
+    def _extrair_json_da_resposta(self, resposta: str) -> Optional[str]:
+        """
+        Extrai JSON da resposta do GPT usando múltiplas estratégias.
+        Retorna o JSON como string ou None se não encontrar.
+        """
+        if not resposta:
+            return None
+
+        # Estratégia 1: JSON entre ```json ... ```
+        match = re.search(r'```json\s*(\[.*?\])\s*```', resposta, re.DOTALL)
+        if match:
+            return match.group(1)
+
+        # Estratégia 2: JSON entre ``` ... ```
+        match = re.search(r'```\s*(\[.*?\])\s*```', resposta, re.DOTALL)
+        if match:
+            return match.group(1)
+
+        # Estratégia 3: Procurar por array JSON diretamente
+        match = re.search(r'(\[\s*\{.*?\}\s*\])', resposta, re.DOTALL)
+        if match:
+            return match.group(1)
+
+        # Estratégia 4: Se a resposta inteira parece ser JSON
+        resposta_limpa = resposta.strip()
+        if resposta_limpa.startswith('[') and resposta_limpa.endswith(']'):
+            return resposta_limpa
+
+        return None
+
+    def _parse_json_seguro(self, json_str: str, noticia_id: int) -> Optional[List[Dict]]:
+        """
+        Faz parse do JSON de forma segura, com múltiplas tentativas.
+        """
+        if not json_str:
+            return None
+
+        # Tentativa 1: Parse direto
+        try:
+            parsed = json.loads(json_str)
+            if isinstance(parsed, list):
+                return parsed
+            elif isinstance(parsed, dict):
+                # Se retornou um objeto único, tenta extrair uma lista
+                if 'nomes' in parsed:
+                    return parsed['nomes'] if isinstance(parsed['nomes'], list) else None
+                return [parsed]  # Wraps em lista se for um objeto único
+        except json.JSONDecodeError as e:
+            logger.debug(f"Erro no parse JSON (tentativa 1) para notícia {noticia_id}: {e}")
+
+        # Tentativa 2: Limpar possíveis caracteres inválidos
+        try:
+            json_limpo = re.sub(r'[^\x20-\x7E\n\r\t]', '', json_str)  # Remove caracteres não-ASCII problemáticos
+            parsed = json.loads(json_limpo)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError as e:
+            logger.debug(f"Erro no parse JSON (tentativa 2) para notícia {noticia_id}: {e}")
+
+        # Tentativa 3: Procurar por objetos JSON individuais e agrupá-los
+        try:
+            objetos = re.findall(r'\{[^{}]*\}', json_str, re.DOTALL)
+            if objetos:
+                parsed_objs = [json.loads(obj) for obj in objetos]
+                return parsed_objs
+        except (json.JSONDecodeError, Exception) as e:
+            logger.debug(f"Erro no parse JSON (tentativa 3) para notícia {noticia_id}: {e}")
+
+        logger.error(f"Não foi possível fazer parse do JSON para notícia {noticia_id}. JSON recebido: {json_str[:500]}")
+        return None
+
+    def _filtrar_pessoas_fisicas(self, resposta_dict: List[Dict], noticia_id: int) -> List[Dict]:
+        """
+        Filtra apenas pessoas físicas da resposta do GPT.
+        Aplica heurísticas para casos onde PESSOA não está presente mas é claramente uma pessoa.
+        """
+        nomes_filtrados = []
+        total_entidades = len(resposta_dict)
+
+        for rd in resposta_dict:
+            nome = rd.get('NOME')
+            if not nome or not nome.strip():
+                continue
+
+            pessoa = rd.get('PESSOA', '').upper().strip()
+            
+            # Caso 1: PESSOA explicitamente marcada como 'F'
+            if pessoa == 'F':
+                nomes_filtrados.append(rd)
+                logger.debug(f"Pessoa física confirmada: {nome}")
+                continue
+
+            # Caso 2: PESSOA marcada como 'J' - descarta (organização)
+            if pessoa == 'J':
+                logger.debug(f"Organização descartada: {nome}")
+                continue
+
+            # Caso 3: PESSOA não presente ou vazio - aplicar heurística
+            # Se tem campos típicos de pessoa física (SEXO, IDADE), provavelmente é uma pessoa
+            tem_sexo = rd.get('SEXO') is not None
+            tem_idade = rd.get('IDADE') is not None
+            tem_aniversario = rd.get('ANIVERSARIO') is not None
+            
+            # Heurística: se tem SEXO ou IDADE, é provavelmente uma pessoa física
+            # Mas só incluímos se NÃO tiver características de organização
+            nome_upper = nome.upper()
+            indicadores_org = [
+                'MINISTÉRIO', 'SERVIÇO', 'DEPARTAMENTO', 'SECRETARIA', 
+                'TRIBUNAL', 'JUSTIÇA', 'POLÍCIA', 'CORPO', 'FORÇA',
+                'EMPRESA', 'LTDA', 'SA', 'ME', 'EPP'
+            ]
+            
+            parece_organizacao = any(ind in nome_upper for ind in indicadores_org)
+            
+            if (tem_sexo or tem_idade or tem_aniversario) and not parece_organizacao:
+                # Adiciona com PESSOA = 'F' para garantir consistência
+                rd['PESSOA'] = 'F'
+                nomes_filtrados.append(rd)
+                logger.debug(f"Pessoa física inferida (heurística): {nome}")
+            else:
+                logger.debug(f"Entidade descartada (sem classificação clara): {nome} (PESSOA={pessoa})")
+
+        return nomes_filtrados
 
     def get_por_reg_noticia(self, reg):
         noticia = (

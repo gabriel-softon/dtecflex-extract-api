@@ -1,0 +1,35 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=America/Sao_Paulo
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN pip install poetry==1.8.3
+
+ENV PATH="/root/.local/bin:$PATH"
+
+RUN poetry config virtualenvs.create false
+
+WORKDIR /app
+
+COPY pyproject.toml poetry.lock* ./
+COPY src/ ./src/
+
+RUN poetry lock --no-interaction || true && \
+    poetry install --no-interaction --no-ansi
+
+EXPOSE 7373
+
+CMD ["poetry", "run", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "7373", "--reload"]
+
